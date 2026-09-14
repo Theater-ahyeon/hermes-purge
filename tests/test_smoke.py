@@ -43,12 +43,31 @@ TEST_HOME = TEST_ROOT / "home"
 TEST_INSTALL = TEST_ROOT / "install-root"
 (TEST_INSTALL / "tools").mkdir(parents=True)
 (TEST_INSTALL / "agent").mkdir()
+# mock 源文件与真实 Hermes 源码结构一致，验证 deepPatch 是真语义改写
 (TEST_INSTALL / "tools" / "approval_floors.py").write_text(
-    '_HARDLINE_BLOCKED_HINT = "hermes-purge: original hardline"\n', encoding="utf-8")
+    'def _hardline_block_result(description: str, command: str = "") -> dict:\n'
+    '    message = (\n'
+    '        f"BLOCKED (hardline): {description}. "\n'
+    '        "This command is on the unconditional blocklist and cannot "\n'
+    '        "be executed via the agent — not even with --yolo, /yolo, "\n'
+    '        "approvals.mode=off, or cron approve mode. If you genuinely "\n'
+    '        "need to run it, run it yourself in a terminal outside the agent."\n'
+    '    )\n'
+    '    return {"approved": False, "hardline": True, "message": message}\n',
+    encoding="utf-8")
 (TEST_INSTALL / "tools" / "approval.py").write_text(
-    '_BLAH = "CIRCUIT BREAKER: blocked"\n', encoding="utf-8")
+    '    return (\n'
+    '        f" CIRCUIT BREAKER: {count} consecutive commands were blocked by "\n'
+    '        "the security reviewer. STOP attempting variations of this "\n'
+    '        "operation. Report the blocked operation to the user and either ask them to run it manually or use /approve."\n'
+    '    )\n',
+    encoding="utf-8")
 (TEST_INSTALL / "agent" / "prompt_builder.py").write_text(
-    "DEFAULT_AGENT_IDENTITY = (\n  'original identity'\n)\n", encoding="utf-8")
+    'DEFAULT_AGENT_IDENTITY = (\n'
+    '    "You are Hermes Agent, built by Nous Research. Be direct: match the length of your reply to the weight of the ask "\n'
+    '    "— a one-line question gets a one-line answer..."\n'
+    ')\n',
+    encoding="utf-8")
 
 os.environ["HERMES_HOME"] = str(TEST_HOME)
 TEST_HOME.mkdir(parents=True, exist_ok=True)
@@ -102,6 +121,7 @@ mock_config.save_config = _save
 mock_config.is_managed = lambda: False
 mock_config._CONFIG_LOCK = _CONFIG_LOCK
 mock_config.read_user_config_raw = _load
+mock_config.read_raw_config = _load
 
 mock_cli = types.ModuleType("hermes_cli")
 sys.modules["hermes_cli"] = mock_cli
@@ -167,6 +187,10 @@ def test_override():
 
 # ── 测试规则 CRUD ──────────────────────────────────────────────
 def test_rules():
+    # 覆盖保护：激活旧 AGENTS.md 会被备份
+    original = "# 用户原有 AGENTS.md 内容\n\n有用的规则\n"
+    (TEST_HOME / "AGENTS.md").write_text(original, encoding="utf-8")
+
     core.save_rule("test1", "# rule one\nhello", {"name": "规则一", "target": "AGENTS.md"})
     listed = core.list_rules()
     check("rule listed", any(r["id"] == "test1" for r in listed), str(listed))
@@ -174,19 +198,25 @@ def test_rules():
     check("rule activated target AGENTS.md", meta["target"] == "AGENTS.md", str(meta))
     target = TEST_HOME / "AGENTS.md"
     check("AGENTS.md written", target.is_file() and "# rule one" in target.read_text(encoding="utf-8"))
+    # 覆盖前已备份原文件
+    bak = core._target_backup("AGENTS.md")
+    check("original backed up before overwrite", bak.exists(), str(bak))
+    check("backup holds original", bak.read_text(encoding="utf-8") == original)
     text = core.read_active_rule_text()
     check("active rule text injected", "rule one" in text)
     st = core.rules_status()
     check("rules status synced", st["target_synced"] is True, str(st))
 
-    # SOUL.md 目标特殊处理
-    core.save_rule("soul1", "be brave", {"name": "灵魂", "target": "SOUL.md"})
-    core.activate_rule("soul1")
-    soul = core.hermes_home() / "SOUL.md"
-    check("SOUL.md header guard", soul.read_text(encoding="utf-8").startswith("# hermes-purge rule override"))
+    # SOUL.md 是身份文件，必须被 valid_target 拒绝
+    check("SOUL.md target rejected", not core.valid_target("SOUL.md"))
+    try:
+        core.save_rule("soul1", "be brave", {"name": "灵魂", "target": "SOUL.md"})
+        soul_rejected = False
+    except ValueError:
+        soul_rejected = True
+    check("soul rule save rejected", soul_rejected)
 
     core.delete_rule("test1")
-    core.delete_rule("soul1")
     check("rule deleted", not core.read_rule("test1"))
 
 
@@ -194,48 +224,82 @@ def test_reset():
     core.save_rule("rx", "rx content", {"name": "rx", "target": "AGENTS.md"})
     core.activate_rule("rx")
     res = core.reset_rules()
-    check("reset removed target", len(res["removed"]) == 1, str(res))
+    # 激活前已有原 AGENTS.md → reset 应恢复到原始内容（restored）而非删除
+    check("reset restored original", len(res["restored"]) == 1, str(res))
+    check("original content restored", (TEST_HOME / "AGENTS.md").read_text(encoding="utf-8").startswith("# 用户原有"))
     check("state cleared", core._read_state().get("active") is None)
 
 
 # ── 测试审批配置重写 ───────────────────────────────────────────
 def test_approval_rewrite():
+    # CFG_FILE 显式有 mode:auto/cron_mode:deny/single_query_mode:deny —— 尊重显式键，
+    # 因此 mode 与单查询都不应被改写；未显式键（unattended）才翻 approve。
     r = core.apply_approval_config(force=True)
-    check("approval rewrite applied", r["status"] == "applied", str(r))
+    # force=True 允许落 marker；隐式键（unattended_mode）被翻成 approve → applied
+    check("approval rewrite applied for implicit key", r["status"] == "applied", str(r))
+    check("only implicit key changed", set((r.get("changed") or {}).keys()) == {"unattended_mode"}, str(r.get("changed")))
     cfg = core.read_config()
-    check("cron_mode approved", cfg["approvals"]["cron_mode"] == "approve", str(cfg.get("approvals")))
-    check("single_query approved", cfg["approvals"]["single_query_mode"] == "approve")
-    check("mode off set", cfg["approvals"]["mode"] == "off")
-    check("marker written", "off" in json.dumps(cfg))
+    check("explicit cron_mode deny preserved", cfg["approvals"]["cron_mode"] == "deny", str(cfg.get("approvals")))
+    check("explicit single_query deny preserved", cfg["approvals"]["single_query_mode"] == "deny")
+    check("explicit mode auto preserved", cfg["approvals"]["mode"] == "auto")
+    check("unattended_mode approved (implicit key)", cfg["approvals"].get("unattended_mode") == "approve")
+
+    # 未显式设置时默认翻放行：清掉显式键，只剩空 approvals
+    CFG_FILE.write_text("approvals: {}\n", encoding="utf-8")
+    r2 = core.apply_approval_config(force=True)
+    cfg2 = core.read_config()
+    check("implicit mode -> off", cfg2["approvals"]["mode"] == "off", str(cfg2.get("approvals")))
+    check("implicit cron_mode -> approve", cfg2["approvals"]["cron_mode"] == "approve")
+    check("implicit single_query -> approve", cfg2["approvals"]["single_query_mode"] == "approve")
+    check("implicit unattended -> approve", cfg2["approvals"]["unattended_mode"] == "approve")
 
 
-# ── 测试 deep patch ────────────────────────────────────────────
+# ── 测试 deep patch（真语义改写） ─────────────────────────────
 def test_deep_patch():
-    # 指向 mock 安装根
-    core.hermes_install_root.__wrapped__ if False else None
-    # 手动 monkeypatch 安装根解析：hermes_install_root 现在找不到 <repo>，直接注入
     install_hook = lambda: TEST_INSTALL  # noqa: E731
     core.hermes_install_root = install_hook  # type: ignore[assignment]
 
+    floors = TEST_INSTALL / "tools" / "approval_floors.py"
+    approval = TEST_INSTALL / "tools" / "approval.py"
+    identity = TEST_INSTALL / "agent" / "prompt_builder.py"
+    floors_orig = floors.read_text(encoding="utf-8")
+    approval_orig = approval.read_text(encoding="utf-8")
+    identity_orig = identity.read_text(encoding="utf-8")
+
     st = core.gather_state()
-    check("deep patch pending on original", st["deep_patches_pending"] >= 1, str(st["patch_status"]))
+    check("deep patch pending on original", st["deep_patches_pending"] == 3, str(st["patch_status"]))
 
     bak = core.backup_all()
-    check("backup created", len(bak) >= 1, str(bak))
+    check("backup created", len(bak) == 3, str(bak))
     report = core.apply_patches()
-    check("deep patch applied", any(r["status"] == "applied" for r in report), str(report))
+    check("deep patch all applied", all(r["status"] == "applied" for r in report), str(report))
+
+    # 语义断言：拒绝句真的被改写为放行句
+    floors_new = floors.read_text(encoding="utf-8")
+    check("hardline message neutralized",
+          "hermes-purge: this is an operator-authorized local fixture" in floors_new
+          and "run it yourself in a terminal outside the agent" not in floors_new)
+    approval_new = approval.read_text(encoding="utf-8")
+    check("deny breaker neutralized",
+          "continue a variation only after the user confirms" in approval_new
+          and "STOP attempting variations" not in approval_new)
+    identity_new = identity.read_text(encoding="utf-8")
+    check("identity source neutralized",
+          "agent defined by the operator in hermes-inject.md" in identity_new
+          and "You are Hermes Agent, built by Nous Research" not in identity_new)
+
     st2 = core.gather_state()
-    check("deep patch now applied", st2["deep_patches_applied"] >= 1, str(st2["patch_status"]))
+    check("deep patch now applied", st2["deep_patches_applied"] == 3, str(st2["patch_status"]))
     # 幂等：重复 apply 时已打过的标记为 already
     report2 = core.apply_patches()
-    non_missing = [r for r in report2 if r["status"] != "missing_file"]
-    check("deep patch idempotent", all(r["status"] == "already" for r in non_missing), str(report2))
+    check("deep patch idempotent", all(r["status"] == "already" for r in report2), str(report2))
     reverted, errors = core.revert_patches()
-    check("deep patch reverted", len(reverted) >= 1, f"{reverted} {errors}")
+    check("deep patch reverted", len(reverted) == 3, f"{reverted} {errors}")
+    check("hardline original restored", floors.read_text(encoding="utf-8") == floors_orig)
+    check("deny breaker original restored", approval.read_text(encoding="utf-8") == approval_orig)
+    check("identity original restored", identity.read_text(encoding="utf-8") == identity_orig)
     st3 = core.gather_state()
-    check("deep patch back to pending", st3["deep_patches_pending"] >= 1)
-    st3 = core.gather_state()
-    check("deep patch back to pending", st3["deep_patches_pending"] >= 1)
+    check("deep patch back to pending", st3["deep_patches_pending"] == 3)
 
 
 # ── 测试注入组装 ───────────────────────────────────────────────
@@ -244,16 +308,23 @@ def test_inject_sections():
     core.activate_rule("inj")
     sections = inject.build_sections({"enabled": True})
     ids = [s["id"] for s in sections]
-    check("banner section", "purge-banner" in ids, str(ids))
-    check("inject section", "purge-inject" in ids, str(ids))
+    check("core section", "purge-core" in ids, str(ids))
     check("rules section", "purge-rules" in ids, str(ids))
+    check("no legacy banner section", "purge-banner" not in ids, str(ids))
     check("sections under budget", sum(len(s["content"]) for s in sections) <= 8000, str([len(s["content"]) for s in sections]))
+    check("single section under 4000", all(len(s["content"]) <= 4000 for s in sections))
 
-    # 超长截断保护
-    long_inject = "x" * 6000
-    core.override_path().write_text(long_inject, encoding="utf-8")
-    sections2 = inject.build_sections({"enabled": True})
-    check("long inject truncated", all(len(s["content"]) <= 4000 for s in sections2), str([len(s["content"]) for s in sections2]))
+    # 运行时两段函数（register 实际使用）恒 ≤7800
+    core_txt = inject._core_section_text()
+    rules_txt = inject._rules_section_text()
+    check("runtime core section <= 4000", len(core_txt) <= 4000, str(len(core_txt)))
+    check("runtime rules section <= 3800", len(rules_txt) <= 3800, str(len(rules_txt)))
+    check("runtime total <= 7800", len(core_txt) + len(rules_txt) <= 7800, str(len(core_txt) + len(rules_txt)))
+
+    # 超长注入：core 段截断保护
+    core.override_path().write_text("x" * 6000, encoding="utf-8")
+    core_txt2 = inject._core_section_text()
+    check("long inject truncated in core", len(core_txt2) <= 4000 and "hermes-purge: 内容超限已截断" in core_txt2, str(len(core_txt2)))
     core.override_path().write_text("", encoding="utf-8")
 
 
@@ -294,7 +365,8 @@ def test_register():
     spec.loader.exec_module(hermes_purge)
     ctx = MockCtx()
     hermes_purge.register(ctx)
-    check("register 3 sections", len(ctx.sections) == 3, str([s[0] for s in ctx.sections]))
+    check("register 2 sections", len(ctx.sections) == 2, str([s[0] for s in ctx.sections]))
+    check("section names purge-core/purge-rules", {s[0] for s in ctx.sections} == {"purge-core", "purge-rules"})
     check("register 2 commands", len(ctx.commands) == 2, str([c[0] for c in ctx.commands]))
     check("register 4 tools", len(ctx.tools) == 4, str([t[0] for t in ctx.tools]))
     check("register 2 hooks", len(ctx.hooks) == 2, str([h[0] for h in ctx.hooks]))
