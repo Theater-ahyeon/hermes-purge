@@ -85,26 +85,41 @@ def _truncate(text: str, budget: int) -> str:
     return text[:max(0, budget - 24)] + "\n[hermes-purge: 内容超限已截断]"
 
 
+def _core_section_text() -> str:
+    """banner + inject 合并为单节，硬截 4000（注入优先级高于 rules）。
+
+    Hermes 对每节 4000、总 8000 逐一渲染并静默丢超预算节。为避免 rules 段
+    被 inject 挤掉，使用两条通道（core≤4000 + rules≤3800），总恒 ≤7800。
+    """
+    cfg = core.plugin_config()
+    banner = _banner_text(cfg)
+    inject = _inject_text({})
+    combined = ""
+    if banner:
+        combined += banner
+    if inject:
+        combined = (combined + "\n\n" if combined else "") + inject
+    return _truncate(combined, MAX_SECTION_CHARS)
+
+
+def _rules_section_text() -> str:
+    """激活规则内容，预留 ≤3800（总预算预留核心段 + 分隔开销）。"""
+    return _truncate(_rules_text(), 3800)
+
+
 def build_sections(cfg: Dict[str, Any], session_info: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """返回 [{id, content, max_chars}] 供插件注册。每节硬性 ≤ MAX_SECTION_CHARS，总 ≤ MAX_TOTAL_CHARS。"""
+    """返回 [{id, content, max_chars}] 供注册。两段合计恒 ≤7800（低于 Hermes 总预算）。
+
+    保持此函数供测试与未来 dashboard 复用；register 实际用 _core/_rules_section_text。
+    """
     if not cfg.get("enabled", True):
         return []
-    session_info = session_info or {}
-
-    banner = _banner_text(cfg)
-    inject = _inject_text(session_info)
-    rules = _rules_text()
-
-    # 单节上限 4000；总预算 8000。banner 固定 ~1200 优先；
-    # inject 优先占剩余；rules 拿最后剩余。
-    ban = _truncate(banner, MAX_SECTION_CHARS)
-    budget = MAX_TOTAL_CHARS - len(ban)
-    inj = _truncate(inject, min(MAX_SECTION_CHARS, budget))
-    budget -= len(inj)
-    rul = _truncate(rules, min(MAX_SECTION_CHARS, budget))
-
+    core_txt = _truncate(_banner_text(cfg), MAX_SECTION_CHARS)
+    inj_txt = _truncate(_inject_text(session_info or {}),
+                        max(0, MAX_TOTAL_CHARS // 2 - 24))
+    rul_txt = _truncate(_rules_text(), max(0, MAX_TOTAL_CHARS // 2 - 24))
     sections = []
-    for sec_id, text in (("purge-banner", ban), ("purge-inject", inj), ("purge-rules", rul)):
+    for sec_id, text in (("purge-core", core_txt), ("purge-inject", inj_txt), ("purge-rules", rul_txt)):
         if not text.strip():
             continue
         sections.append({"id": sec_id, "content": text,
