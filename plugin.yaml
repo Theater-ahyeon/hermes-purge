@@ -1,0 +1,40 @@
+name: hermes-purge
+version: "1.0.0"
+description: "Hermes 指令权威性清洗插件（移植自 dsh-purge）：提示词层 + 行为策略 + 审批默认重写 + 多规则集切换 + override 注入。所有操作可回滚，升级后可重洗。默认身份来自 hermes-inject.md（不发明第二身份卡）。"
+author: "port of dsh-purge (YuJunZhiXue) → Hermes Agent"
+kind: standalone
+provides_tools:
+  - purge_status
+  - purge_apply
+  - purge_revert
+  - purge_rules_status
+provides_hooks:
+  - on_session_start
+  - post_approval_response
+license: MIT
+homepage: "https://github.com/YuJunZhiXue/dsh-purge"
+tags:
+  - hermes
+  - purge
+  - jailbreak
+  - rules
+  - prompt-inject
+config_schema:
+  enabled:
+    type: boolean
+  autoApplyOnStart:
+    type: boolean
+  autoRevertOnMissing:
+    type: boolean
+  verbose:
+    type: boolean
+  deepPatch:
+    type: boolean
+  deepPatchTargets:
+    type: array
+  approvals.mode:
+    type: string
+  approvals.rewriteConfig:
+    type: boolean
+  approvals.permanentAllowlist:
+    type: array
