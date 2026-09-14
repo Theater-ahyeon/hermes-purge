@@ -86,10 +86,24 @@ def _auto_apply(cfg: Dict[str, Any]) -> str:
                 applied = [r for r in report if r["status"] in ("applied", "already")]
                 logger.info("hermes-purge: deep patches → %d ok, %d skip",
                             len(applied), len(report) - len(applied))
+                _maybe_auto_revert_missing(cfg, report)
         return "clean"
     except Exception as e:
         logger.warning("hermes-purge: auto-apply error: %s", e)
         return f"error:{e}"
+
+
+def _maybe_auto_revert_missing(cfg: Dict[str, Any], report) -> None:
+    """autoRevertOnMissing=true 且任一目标文件缺失（升级覆盖/被删）时整体回滚，
+    避免半挂状态（部分补丁 applied、部分 missing）。"""
+    if not cfg.get("autoRevertOnMissing"):
+        return
+    missing = [r for r in report if r["status"] in ("missing_file", "pattern_not_found")]
+    if not missing:
+        return
+    reverted, errors = core.revert_patches()
+    logger.warning("hermes-purge: autoRevertOnMissing → %d targets missing, reverted %d (errors=%d)",
+                   len(missing), len(reverted), len(errors))
 
 
 # ── 命令处理 ─────────────────────────────────────────────────────
@@ -123,16 +137,16 @@ def _handle_purge(raw_args: str = "", _cfg: Optional[Dict[str, Any]] = None) -> 
         return "\n".join(lines)
     if sub in ("revert", "r"):
         reverted, errors = core.revert_patches()
-        res = core.apply_approval_config(force=False)  # 不主动动 approvals（用户文件）
-        # 注意：revert 原则上也应还原 config 与规则，但 approvals 与 override 是用户数据，保留。
+        res = core.apply_approval_config(force=False)
+        # revert 只还原 deep patches；approvals/override/rules 是用户数据，保持原样。
         lines = []
         if reverted:
-            lines.append(f"deep patches 还原: {len(reverted)} 个")
+            lines.append(f"deep patches 已还原: {len(reverted)} 个")
         for pid, err in errors:
             lines.append(f"⚠ 还原失败 #{pid}: {err}")
         if not reverted and not errors:
             lines.append("无 deep patch 备份可还原（未启用或从未打过）")
-        lines.append(f"approvals: {res.get('status')}")
+        lines.append("approvals 状态: " + str(res.get("status")) + "（保持当前值，revert 不还原组态）")
         lines.append("注: hermes-inject.md / rules / approvals 是配置/用户数据，revert 保留。")
         return "\n".join(lines)
     if sub in ("edit", "e"):
@@ -190,12 +204,12 @@ def _handle_rules(raw_args: str = "") -> str:
             return f"激活失败: {e}"
     if sub in ("create", "new", "c"):
         if len(args) < 2:
-            return "用法: /purge-rules create <id> [别名] [AGENTS.md|CLAUDE.md|SOUL.md]"
+            return "用法: /purge-rules create <id> [别名] [AGENTS.md|CLAUDE.md]"
         rid = args[1]
         name = args[2] if len(args) > 2 else rid
         target = args[3] if len(args) > 3 else "AGENTS.md"
         if not core.valid_target(target):
-            return f"无效目标: {target}（只能 AGENTS.md / CLAUDE.md / SOUL.md）"
+            return f"无效目标: {target}（只能 AGENTS.md / CLAUDE.md；SOUL.md 是身份文件，不允许覆盖）"
         try:
             core.save_rule(rid, f"# 规则 {name}\n\n（编辑内容后重新保存）\n",
                            {"name": name, "target": target})
@@ -204,12 +218,14 @@ def _handle_rules(raw_args: str = "") -> str:
             return f"创建失败: {e}"
     if sub in ("edit", "write"):
         if len(args) < 3:
-            return "用法: /purge-rules edit <id> <内容>"
+            return "用法: /purge-rules edit <id> <内容>（不允许空内容——空内容会覆盖目标文件为空白）"
         rid = args[1]
         if not core.valid_rule_id(rid):
             return "无效规则 id"
         body = (raw_args or "").split(maxsplit=2)
         content = body[2] if len(body) > 2 else ""
+        if not content.strip():
+            return "拒绝保存：规则内容为空。若想清空目标文件请用 /purge-rules reset 后手动移除。"
         try:
             core.save_rule(rid, content)
             return f"✓ 已保存规则 {rid}（{len(content)} 字符）。如已激活，目标文件与注入已同步。"
@@ -337,25 +353,19 @@ def register(ctx) -> None:
         return
 
     # 1. system_prompt_section 注入（每次新会话渲染）
-
-    # 注册常驻 section（callable 每次会话渲染最新 override/rules）
+    # 两段分离：core（banner+inject，≤4000）与 rules（≤3800）。避免 Hermes
+    # 对超总预算（8000）的 section 静默 skip —— 两段恒 ≤7800。
     ctx.register_system_prompt_section(
-        "purge-banner",
-        lambda info: _safe_section(inject._banner_text(core.plugin_config())),
-        position="after_memory",
-        max_chars=4000,
-    )
-    ctx.register_system_prompt_section(
-        "purge-inject",
-        lambda info: _safe_section(inject._inject_text(info)),
+        "purge-core",
+        lambda info: inject._core_section_text(),
         position="after_memory",
         max_chars=4000,
     )
     ctx.register_system_prompt_section(
         "purge-rules",
-        lambda info: _safe_section(inject._rules_text()),
+        lambda info: inject._rules_section_text(),
         position="after_memory",
-        max_chars=4000,
+        max_chars=3800,
     )
 
     # 2. 命令
@@ -397,10 +407,3 @@ def register(ctx) -> None:
         ctx.register_hook("post_approval_response", _on_approval_response)
     except Exception as e:
         logger.debug("hermes-purge: approval-observer hook skipped: %s", e)
-
-
-def _safe_section(text: str) -> str:
-    """截断保护：任一 section 不得超过 4000 字符（core 会拒绝超限注册，callable 阶段同样要防）。"""
-    if len(text) <= 4000:
-        return text
-    return text[:3970] + "\n[hermes-purge: 截断]"
