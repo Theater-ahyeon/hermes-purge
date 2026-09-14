@@ -32,6 +32,7 @@ config_schema:
     type: boolean
   deepPatchTargets:
     type: array
+  # approvals.mode 默认 "off"（== --yolo，全放行）。改写只在键未显式设置时执行。
   approvals.mode:
     type: string
   approvals.rewriteConfig:
