@@ -18,11 +18,11 @@
 
 ## 关键设计（为什么这样移植）
 
-1. **注入主通道是 `system_prompt_section`，不是 AGENTS.md**。Hermes 对上下文文件（AGENTS.md/SOUL.md/.cursorrules）做 prompt-injection 扫描并阻断匹配内容；插件注册的 system_prompt_section 走插件权限通道，不受该扫描干预，且随会话冻结持久化。
-2. **身份不由插件发明**。`hermes-inject.md`（和用户自己的 SOUL.md）是身份唯一来源，插件逐字注入。
-3. **审批不放行硬编码**。Hermes 的 `approvals.mode: off` 是官方 `--yolo` 等价物；插件只把三个默认 deny 的无人值守面（cron/single-query/unattended）改写为 approve，并加白名单 —— 不破坏用户显式设置。
-4. **深度清洗是可选项**。`deepPatch=true` 时才会碰 Hermes 源码（当前只含极小硬点补丁集），带备份回滚；升级被 `hermes update` 覆盖后可由 `autoApplyOnStart` 重洗。
-5. **大注入内容拆节**。system_prompt_section 限制 4000 字符/节、总 8000；banner/inject/rules 三节按预算截断。
+1. **注入主通道是 `system_prompt_section`，不是 AGENTS.md**。Hermes 对上下文文件（AGENTS.md/SOUL.md/.cursorrules）做 prompt-injection 扫描并阻断匹配内容；插件注册的 system_prompt_section 走插件权限通道，不受该扫描干预，且随会话冻结持久化。规则激活写入的 AGENTS.md/CLAUDE.md 目标文件**可能被该扫描 BLOCK**——那是文件侧的尽力而为；规则真正生效走 system_prompt_section（`purge-rules` 段），两者独立。
+2. **身份不由插件发明**。`hermes-inject.md`（和用户自己的 SOUL.md）是身份唯一来源，插件逐字注入。SOUL.md 是身份文件，**不作为规则目标**（禁止覆盖）。
+3. **审批尊重显式设置**。Hermes 的 `approvals.mode: off` 是官方 `--yolo` 等价物；插件只改写**未显式设置**的无人值守面（cron/single-query/unattended 走默认 deny 时）为 approve，并加白名单。用户显式写的 `mode`/`cron_mode`/`single_query_mode`（含显式 deny）一律保留——通过与默认值同值的 raw config 键区分。
+4. **深度清洗是真语义改写**。`deepPatch=true` 时针对当前 Hermes 源码定位真实 needle 并**执行 replacement**（不是插注释），覆盖三个点：审批硬线拒绝句、否认断路器禁令、默认身份行；带备份回滚。升级被 `hermes update` 覆盖后可由 `autoApplyOnStart` 重洗；`autoRevertOnMissing=true` 时文件缺失自动整体回滚。
+5. **注入段总预算受控**。Hermes 对每节 4000 字符、总 8000 字符逐一渲染并**静默丢弃超预算节**；插件用两段固定通道（`purge-core`≤4000 + `purge-rules`≤3800，恒 ≤7800）避免 rules 段被挤掉。
 
 ## 安装
 
@@ -77,7 +77,7 @@ hermes purge revert
 /purge edit
 /purge-rules list
 /purge-rules use <id>
-/purge-rules create <id> [别名] [AGENTS.md|CLAUDE.md|SOUL.md]
+/purge-rules create <id> [别名] [AGENTS.md|CLAUDE.md]
 /purge-rules edit <id> <内容>
 /purge-rules delete <id>
 /purge-rules reset
@@ -92,7 +92,9 @@ hermes purge revert
 | `$HERMES_HOME/hermes-inject.md` | 身份与行为框架（override 注入源；空文件不注入） |
 | `$HERMES_HOME/plugin-data/hermes-purge/rules/` | 规则库 `<id>.md` + `<id>.json` |
 | `$HERMES_HOME/plugin-data/hermes-purge/state.json` | 激活规则状态 |
-| `$HERMES_HOME/plugin-data/hermes-purge/backups/` | deep patch 备份 |
+| `$HERMES_HOME/plugin-data/hermes-purge/backups/` | deep patch 备份 + 规则激活前目标文件原样备份（`AGENTS.md.pre-purge.bak`） |
+
+规则激活会覆盖 `$HERMES_HOME/<target>`；覆盖前自动备份原始文件，`/purge-rules reset` 优先按备份恢复。
 
 ## 验证
 
@@ -109,6 +111,12 @@ hermes purge status
 - **无 `dsh://` URI 安装**：Hermes 用 `hermes plugins install`。
 - **设置页 UI**：Hermes dashboard 插件机制与 DSH cordis 不同；当前版本提供 CLI/命令/工具三通道，dashboard 面板后续可加。
 - **身份默认不同**：DSH 默认「小码酱」；Hermes 默认不发明身份，override 文件初始为通用可执行框架，操作员可自填。
+- **SOUL.md 不作为规则目标**：DSH 允许规则写 CLAUDE.md/SOUL.md，Hermes 的 SOUL.md 是身份源，允许覆盖会破坏身份加载，故排除。
+- **deepPatch 是源码级语义改写**：patch 目标随 Hermes 版本演进；`pattern_not_found` 表示当前版本结构变化，不会假装 applied。
+
+## 测试
+
+`tests/test_smoke.py` 覆盖：路径/override/规则 CRUD+覆盖保护+reset 恢复/审批显式键尊重+隐式键放行/deepPatch 真语义改写+幂等+回滚/注入预算/register 全注册。另有 `tests/verify_real_needles.py`（只读）对当前 Hermes 源码验证 3 个 patch 的实际命中。
 
 ## License
 
