@@ -26,37 +26,68 @@
 
 ## 安装
 
+实测过的完整步骤。**注意：安装时传的 `--enable` 不会真的启用插件**——它只把文件放到位，
+`plugins list` 里仍然是 `not enabled`，必须再显式跑一次 `enable`。
+
 ```sh
-# 仓库根即插件根（hermes plugins install 会把 clone 根作为插件目录落到 <HERMES_HOME>/plugins/hermes-purge/）
-# 当前机器 HOME: C:\Users\<user>\AppData\Local\hermes
-hermes plugins install <git-url-of-this-repo> --enable
-# 或手动放置：
-Copy-Item -Recurse hermes-purge "$env:LOCALAPPDATA\hermes\plugins\hermes-purge"
+# 1. 安装（仓库根即插件根，clone 落到 <HERMES_HOME>/plugins/hermes-purge/）
+hermes plugins install https://github.com/Theater-ahyeon/hermes-purge
+
+# 2. 启用 —— 这一步不能省
 hermes plugins enable hermes-purge
+#   会问 "Allow this plugin to replace built-in tools?"。本插件不覆盖内置工具，
+#   选 No 即可（非交互环境下自动为 No）。确实需要时才加 --allow-tool-override。
+
+# 3. 验证（应打印状态面板，而不是一行空白）
+hermes purge status
+
+# 4. 可选：把 settings 写进 config.yaml（不写则全部使用默认值）
 ```
 
-安装后插件会打印 `after-install.md` 指引（`$HERMES_HOME/plugins/<name>/after-install.md`）。
+不走 Git 时手动放置：
+
+```powershell
+Copy-Item -Recurse hermes-purge "$env:LOCALAPPDATA\hermes\plugins\hermes-purge"
+hermes plugins enable hermes-purge
+$env:LOCALAPPDATA\hermes\bin\hermes.exe purge status
+```
+
+`$HERMES_HOME` 在本机是 `C:\Users\<user>\AppData\Local\hermes`。
 
 ## 配置
 
-编辑 `$HERMES_HOME/config.yaml`。Hermes 合法 capability 只有 `tools.override` 等
-少数几个；本插件无需声明任何能力（写入走 Python 文件操作，由用户显式配置授权），
-只配置 settings：
+`hermes plugins enable` 只会往 `$HERMES_HOME/config.yaml` 写入这两块：
+
+```yaml
+plugins:
+  enabled:
+    - hermes-purge
+  entries:
+    hermes-purge:
+      allow_tool_override: false
+```
+
+**`settings` 不会被自动写入**，需要自己补。不补也能跑（全部取默认值），但要改
+`deepPatch` / `approvals` / `verbose` 就必须写：
 
 ```yaml
 plugins:
   entries:
     hermes-purge:
-      enabled: true         # 插件总开关
       settings:
-        autoApplyOnStart: true
+        autoApplyOnStart: true   # 新会话启动时自动应用
         verbose: false
-        deepPatch: false       # 深度清洗：补 Hermes 源码（可选，默认关）
+        deepPatch: false         # 深度清洗：补 Hermes 源码（可选，默认关）
+        autoRevertOnMissing: false
         approvals:
-          mode: off            # off = 全放行（== --yolo）；manual/smart 保留人工/智能审批
-          rewriteConfig: true
+          mode: off              # off = 全放行（== --yolo）；manual/smart 保留人工/智能审批
+          rewriteConfig: true    # 只改写"未显式设置"的键，显式值一律保留
           permanentAllowlist: []
 ```
+
+Hermes 合法的 capability 只有 `tools.override` 等少数几个；本插件**不需要**任何
+capability（写入走 Python 文件操作，由用户显式配置授权），所以上一步的
+`allow_tool_override` 保持 `false` 即可。
 
 > 说明：`deepPatch: true` 会改写 Hermes 源码树中的 `tools/approval_floors.py`、
 > `tools/approval.py`、`agent/prompt_builder.py`，带备份回滚；升级被 `hermes update`

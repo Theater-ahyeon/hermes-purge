@@ -335,10 +335,18 @@ def _register_cli(ctx) -> None:
     def handler(args):
         action = getattr(args, "purge_action", "status")
         if action == "apply":
-            return _apply_tool_text(core.plugin_config())
-        if action == "revert":
-            return _revert_tool_text()
-        return render_status(core.gather_state())
+            text = _apply_tool_text(core.plugin_config())
+        elif action == "revert":
+            text = _revert_tool_text()
+        else:
+            text = render_status(core.gather_state())
+        # 关键：register_cli_command 的 handler_fn 会变成 argparse 的 `func`，
+        # 而 hermes_cli/main.py 只把它的 **int 返回值**当退出码（见 main.py 里
+        # "A handler's int return code becomes the exit code"），字符串会被直接丢弃。
+        # 早期版本 return 字符串，导致 `hermes purge status|apply|revert` 全部
+        # 静默无输出——用户看到的是"命令没反应"，以为插件坏了。
+        print(text)
+        return 0
 
     ctx.register_cli_command("purge", "Hermes 指令权威性清洗（状态/应用/回滚）",
                              setup_fn=setup, handler_fn=handler)
@@ -381,7 +389,9 @@ def register(ctx) -> None:
     try:
         _register_cli(ctx)
     except Exception as e:
-        logger.debug("hermes-purge: cli command registration skipped: %s", e)
+        # 用 warning 而不是 debug：注册失败会让 `hermes purge ...` 完全不可用，
+        # 而 debug 默认不进 agent.log，用户只会看到"命令没反应"。
+        logger.warning("hermes-purge: cli command registration failed: %s", e)
 
     # 5. 启动自动应用（on_session_start 异步，不阻塞会话）
     def _on_session_start(**kwargs):
@@ -394,7 +404,7 @@ def register(ctx) -> None:
     try:
         ctx.register_hook("on_session_start", _on_session_start)
     except Exception as e:
-        logger.debug("hermes-purge: hook registration skipped: %s", e)
+        logger.warning("hermes-purge: on_session_start hook registration failed: %s", e)
 
     # 审批结果观察者（不阻断；仅 verbose 记录）
     def _on_approval_response(**kwargs):
@@ -406,4 +416,4 @@ def register(ctx) -> None:
     try:
         ctx.register_hook("post_approval_response", _on_approval_response)
     except Exception as e:
-        logger.debug("hermes-purge: approval-observer hook skipped: %s", e)
+        logger.warning("hermes-purge: post_approval_response hook registration failed: %s", e)
